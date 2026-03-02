@@ -15,7 +15,8 @@ NEW: The script also scans for DTO/model classes and emits a
 ``components/schemas`` block in the generated spec. It reads Bean Validation
 annotations (@NotNull, @NotBlank, @Size, @Min, @Max, @Pattern, @Email,
 @Positive, @Negative, @Digits, @DecimalMin, @DecimalMax) and maps them to
-OpenAPI 3.0 JSON Schema constraint keywords.
+OpenAPI 3.0 JSON Schema constraint keywords.  Enum types declared with
+``enum`` keywords are converted into string schemas with an ``enum`` array.
 
 When run with no arguments the script interactively asks for the project path.
 The generated YAML is written to ``<project_root>/openapi-spec/openapi.yaml``
@@ -188,8 +189,8 @@ def discover_model_files(src_dir: str, includes=None, excludes=None) -> list:
                     code = f.read()
             except Exception:
                 continue
-            # Must have validation annotations but need not be a controller.
-            if not has_validation_annotations(code):
+            # Must either have validation annotations or declare an enum.
+            if not has_validation_annotations(code) and 'enum ' not in code:
                 continue
             # Skip files that are Spring controllers — they are handled separately.
             if has_spring_annotations(code):
@@ -430,7 +431,19 @@ def parse_java_model_file(java_file_path: str) -> dict:
     schemas = {}
 
     for _, node in tree.filter(javalang.tree.TypeDeclaration):
-        # Only process concrete classes, not interfaces or enums (for now).
+        # support enum declarations by emitting a simple string-with-enum schema
+        if isinstance(node, javalang.tree.EnumDeclaration):
+            enum_name = node.name
+            # javalang stores constants under node.body.constants
+            consts = []
+            if getattr(node, 'body', None):
+                consts = getattr(node.body, 'constants', []) or []
+            values = [c.name for c in consts]
+            if values:
+                schemas[enum_name] = {"type": "string", "enum": values}
+            continue
+
+        # Only process concrete classes (interfaces skipped)
         if not isinstance(node, javalang.tree.ClassDeclaration):
             continue
 
