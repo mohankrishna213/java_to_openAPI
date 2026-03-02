@@ -1,17 +1,47 @@
 """Convert Spring Boot controller interfaces into OpenAPI specs.
 
-This script can operate in two modes:
+This script can operate in three modes:
 
 * **Single-file mode** (legacy): provide a path to a Java source file.
   Example: ``python java_to_openapi.py MyController.java``
 
-* **Project mode** (new): point at a Spring Boot project root containing a
+* **Project mode**: point at a Spring Boot project root containing a
   ``pom.xml``. The tool will scan ``src/main/java`` (and other standard
   locations) for Java files that contain Spring Web annotations and merge all
   discovered endpoints into one OpenAPI 3.0 document. You can also filter
   packages with ``--include-packages``/``--exclude-packages``.
 
-NEW: The script also scans for DTO/model classes and emits a
+* **Remote mode** (GitHub or Bitbucket): pass a repository URL with ``--repo``.
+  The repo is shallow-cloned into a temporary directory using GitPython,
+  converted, the YAML is written to disk, and the temp directory is deleted
+  automatically. Supports public and private repos on both providers.
+
+  Authentication
+  --------------
+  GitHub         : ``--token ghp_xxx``  or  env var ``GITHUB_TOKEN``
+  Bitbucket (app password)  : ``--token ATBBxxx --bb-user myusername``
+                              or env vars ``BITBUCKET_TOKEN`` / ``BITBUCKET_USER``
+  Bitbucket (repo access token): ``--token TOKEN``  (no username needed)
+
+  Branch selection
+  ----------------
+  Pass ``--branch develop`` to check out a specific branch or tag.
+  A branch embedded in the URL (e.g. ``.../tree/develop`` for GitHub or
+  ``.../src/develop`` for Bitbucket) is also detected automatically.
+
+  Debugging
+  ---------
+  Pass ``--keep-temp`` to suppress cleanup of the cloned directory.
+
+  Examples::
+
+      python java_to_openapi.py --repo https://github.com/acme/my-service
+      python java_to_openapi.py --repo https://bitbucket.org/acme/my-service
+      python java_to_openapi.py --repo https://github.com/acme/private --token ghp_xxx
+      python java_to_openapi.py --repo https://bitbucket.org/acme/private \\
+          --token ATBBxxx --bb-user myusername --branch develop
+
+The script also scans for DTO/model classes and emits a
 ``components/schemas`` block in the generated spec. It reads Bean Validation
 annotations (@NotNull, @NotBlank, @Size, @Min, @Max, @Pattern, @Email,
 @Positive, @Negative, @Digits, @DecimalMin, @DecimalMax) and maps them to
@@ -21,13 +51,21 @@ OpenAPI 3.0 JSON Schema constraint keywords.  Enum types declared with
 When run with no arguments the script interactively asks for the project path.
 The generated YAML is written to ``<project_root>/openapi-spec/openapi.yaml``
 by default.
+
+Dependencies
+------------
+  pip install javalang pyyaml gitpython
 """
 
 import argparse
 import os
 import re
+import shutil
 import sys
+import tempfile
 
+import git                  # GitPython  →  pip install gitpython
+import git.exc              # Typed Git exceptions
 import javalang
 import yaml
 
@@ -215,6 +253,445 @@ def extract_maven_metadata(pom_path: str) -> dict:
     if ver:
         meta['version'] = ver.group(1)
     return meta
+
+
+# ---------------------------------------------------------------------------
+# Remote repository support  (GitHub + Bitbucket via GitPython)
+# ---------------------------------------------------------------------------
+
+# --- URL patterns for GitHub ---
+# Matches: https://github.com/owner/repo  and  https://github.com/owner/repo/tree/branch
+_GITHUB_HTTPS_RE = re.compile(
+    r"https?://(?:www\.)?github\.com/(?P<owner>[^/]+)/(?P<repo>[^/.]+)"
+    r"(?:\.git)?(?:/tree/(?P<branch>[^/?#]+))?"
+)
+# Matches: git@github.com:owner/repo.git
+_GITHUB_SSH_RE = re.compile(
+    r"git@github\.com:(?P<owner>[^/]+)/(?P<repo>[^/.]+)(?:\.git)?"
+)
+
+# --- URL patterns for Bitbucket ---
+# Note: Bitbucket uses /src/<branch> rather than GitHub's /tree/<branch>
+_BITBUCKET_HTTPS_RE = re.compile(
+    r"https?://(?:www\.)?bitbucket\.org/(?P<owner>[^/]+)/(?P<repo>[^/.]+)"
+    r"(?:\.git)?(?:/src/(?P<branch>[^/?#]+))?"
+)
+# Matches: git@bitbucket.org:owner/repo.git
+_BITBUCKET_SSH_RE = re.compile(
+    r"git@bitbucket\.org:(?P<owner>[^/]+)/(?P<repo>[^/.]+)(?:\.git)?"
+)
+
+
+def parse_repo_url(url: str) -> dict:
+    """Parse a GitHub or Bitbucket URL and return a normalised dict.
+
+    The returned dict always has these keys:
+      provider  : 'github' or 'bitbucket'
+      owner     : repository owner / workspace name
+      repo      : repository name (without .git)
+      branch    : branch embedded in the URL, or None
+      clone_url : clean HTTPS clone URL (no credentials yet)
+
+    Why return a clean clone_url without credentials?
+    Because we want to build the credential-injected URL separately, in one
+    place, so the token never accidentally ends up in a log or error message
+    unless we explicitly choose to redact it first.
+    """
+    url = url.strip()
+
+    m = _GITHUB_HTTPS_RE.match(url)
+    if m:
+        return {
+            "provider":  "github",
+            "owner":     m.group("owner"),
+            "repo":      m.group("repo"),
+            "branch":    m.group("branch"),   # None if not in URL
+            "clone_url": f"https://github.com/{m.group('owner')}/{m.group('repo')}.git",
+        }
+
+    m = _GITHUB_SSH_RE.match(url)
+    if m:
+        return {
+            "provider":  "github",
+            "owner":     m.group("owner"),
+            "repo":      m.group("repo"),
+            "branch":    None,
+            # SSH URLs stay as-is; credential injection only applies to HTTPS
+            "clone_url": url if url.endswith(".git") else url + ".git",
+        }
+
+    m = _BITBUCKET_HTTPS_RE.match(url)
+    if m:
+        return {
+            "provider":  "bitbucket",
+            "owner":     m.group("owner"),
+            "repo":      m.group("repo"),
+            "branch":    m.group("branch"),
+            "clone_url": (
+                f"https://bitbucket.org/{m.group('owner')}/{m.group('repo')}.git"
+            ),
+        }
+
+    m = _BITBUCKET_SSH_RE.match(url)
+    if m:
+        return {
+            "provider":  "bitbucket",
+            "owner":     m.group("owner"),
+            "repo":      m.group("repo"),
+            "branch":    None,
+            "clone_url": url if url.endswith(".git") else url + ".git",
+        }
+
+    raise ValueError(
+        f"Could not recognise '{url}' as a GitHub or Bitbucket URL.\n"
+        "Supported URL forms:\n"
+        "  https://github.com/owner/repo\n"
+        "  https://github.com/owner/repo/tree/branch\n"
+        "  git@github.com:owner/repo.git\n"
+        "  https://bitbucket.org/owner/repo\n"
+        "  https://bitbucket.org/owner/repo/src/branch\n"
+        "  git@bitbucket.org:owner/repo.git"
+    )
+
+
+def _build_auth_url(clone_url: str, provider: str,
+                    token: str, bb_user: str = None) -> str:
+    """Embed authentication credentials into an HTTPS clone URL.
+
+    GitHub:
+      The token alone is placed as the username component:
+        https://ghp_xxx@github.com/owner/repo.git
+      Git treats a bare token as both username and password,
+      which is what GitHub's HTTPS authentication expects.
+
+    Bitbucket (App Password):
+      Bitbucket requires an explicit username alongside the app password:
+        https://myusername:ATBBxxx@bitbucket.org/owner/repo.git
+      If no username is supplied we fall back to 'x-token-auth', which is
+      Bitbucket's official placeholder when using repository access tokens
+      (not app passwords).
+
+    SSH URLs are returned unchanged because they don't carry credentials in
+    the URL — they authenticate via your local SSH key instead.
+    """
+    if not token or not clone_url.startswith("https://"):
+        return clone_url   # SSH or no token → nothing to inject
+
+    if provider == "bitbucket":
+        # For Bitbucket app passwords a real username is required.
+        # For repository access tokens 'x-token-auth' is the documented placeholder.
+        user = bb_user or "x-token-auth"
+        credential = f"{user}:{token}"
+    else:
+        # GitHub: bare token is sufficient
+        credential = token
+
+    return clone_url.replace("https://", f"https://{credential}@", 1)
+
+
+def _redact_url(url: str) -> str:
+    """Replace any embedded credential in a URL with *** for safe printing.
+
+    Turns  https://ghp_secrettoken@github.com/...
+    into   https://***@github.com/...
+
+    This is used whenever we need to print a clone URL to the terminal
+    so that tokens never appear in plain text output or stack traces.
+    """
+    return re.sub(r"(https://)([^@]+)(@)", r"\1***\3", url)
+
+
+# ---------------------------------------------------------------------------
+# GitPython progress reporter
+# ---------------------------------------------------------------------------
+
+class _CloneProgress(git.RemoteProgress):
+    """Real-time clone progress printed to stdout.
+
+    GitPython calls update() each time it receives a progress line from git.
+    We override it to print a human-readable status line and overwrite the
+    same terminal line using a carriage return (\r) so the output doesn't
+    scroll — it stays in one place and updates in real time.
+
+    The different 'op_code' values GitPython sends correspond to stages like
+    counting objects, compressing, receiving data, and resolving deltas.
+    """
+
+    # Map GitPython's numeric stage codes to short human-readable labels.
+    # These are bit-flags defined in git.RemoteProgress.
+    _STAGE_LABELS = {
+        git.RemoteProgress.COUNTING:    "Counting objects",
+        git.RemoteProgress.COMPRESSING: "Compressing",
+        git.RemoteProgress.WRITING:     "Writing",
+        git.RemoteProgress.RECEIVING:   "Receiving",
+        git.RemoteProgress.RESOLVING:   "Resolving deltas",
+        git.RemoteProgress.FINDING_SOURCES: "Finding sources",
+        git.RemoteProgress.CHECKING_OUT:    "Checking out files",
+    }
+
+    def update(self, op_code, cur_count, max_count=None, message=""):
+        # op_code is a bitmask; mask out the BEGIN/END flags to get the stage.
+        stage = op_code & self.OP_MASK
+
+        label = self._STAGE_LABELS.get(stage, "Working")
+        if max_count and max_count > 0:
+            pct = int(100 * cur_count / max_count)
+            line = f"\r[clone] {label}: {cur_count}/{int(max_count)} ({pct}%)"
+        else:
+            line = f"\r[clone] {label}: {cur_count}"
+
+        # \r moves the cursor to the start of the current line so the next
+        # write overwrites it rather than creating a new line.
+        print(line, end="", flush=True)
+
+    def finalize(self):
+        # Print a newline after the last progress update so subsequent output
+        # starts on a fresh line rather than overwriting the progress text.
+        print()
+
+
+# ---------------------------------------------------------------------------
+# Core clone + cleanup functions
+# ---------------------------------------------------------------------------
+
+def clone_repo(repo_url: str,
+               token: str = None,
+               branch: str = None,
+               bb_user: str = None,
+               show_progress: bool = True) -> str:
+    """Clone a GitHub or Bitbucket repository into a new temporary directory.
+
+    Parameters
+    ----------
+    repo_url : str
+        Any URL form recognised by parse_repo_url().
+    token : str, optional
+        Authentication token. For GitHub this is a Personal Access Token
+        (PAT). For Bitbucket this is either an App Password or a Repository
+        Access Token. If not provided, the function checks the environment
+        variables GITHUB_TOKEN (GitHub) and BITBUCKET_TOKEN (Bitbucket).
+    branch : str, optional
+        Branch or tag name to check out. When None the remote's default
+        branch is used. Overrides any branch embedded in the URL.
+    bb_user : str, optional
+        Bitbucket username, required when using Bitbucket App Passwords.
+        Falls back to the BITBUCKET_USER environment variable.
+        Not needed for Bitbucket Repository Access Tokens or GitHub.
+    show_progress : bool
+        Whether to print a live progress line during the clone.
+
+    Returns
+    -------
+    str
+        Absolute path to the temporary directory containing the clone.
+        The caller must delete this directory when finished by calling
+        cleanup_temp_repo() or shutil.rmtree().
+
+    Raises
+    ------
+    ValueError
+        If the URL cannot be parsed as a GitHub or Bitbucket URL.
+    RuntimeError
+        If GitPython cannot find git on the system PATH, or if the clone
+        fails (wrong URL, bad token, network error, etc.).
+    """
+    parsed = parse_repo_url(repo_url)   # raises ValueError for bad URLs
+
+    # Resolve effective branch: CLI arg beats URL-embedded beat default
+    effective_branch = branch or parsed.get("branch")
+
+    # Resolve credentials from arguments, then fall back to env vars
+    if parsed["provider"] == "github":
+        effective_token = token or os.environ.get("GITHUB_TOKEN", "")
+    else:
+        effective_token = token or os.environ.get("BITBUCKET_TOKEN", "")
+
+    effective_bb_user = bb_user or os.environ.get("BITBUCKET_USER", "")
+
+    # Build the authenticated clone URL (token embedded for HTTPS)
+    auth_url = _build_auth_url(
+        parsed["clone_url"],
+        provider=parsed["provider"],
+        token=effective_token,
+        bb_user=effective_bb_user or None,
+    )
+
+    # GitPython requires git to be installed just like subprocess would.
+    # We check for it explicitly so we can raise a clear error message
+    # rather than letting GitPython raise a cryptic internal error.
+    try:
+        git.Git().version()   # runs `git --version` under the hood
+    except git.exc.GitCommandNotFound:
+        raise RuntimeError(
+            "git was not found on your PATH. "
+            "Please install Git (https://git-scm.com) and try again."
+        )
+
+    # Create an isolated temp directory. mkdtemp() sets permissions so only
+    # the current user can read it — important since we store tokens in URLs.
+    temp_dir = tempfile.mkdtemp(prefix=f"java_openapi_{parsed['repo']}_")
+
+    # Log the redacted URL so the user can see what's happening without
+    # ever seeing their token in plain text.
+    safe_url = _redact_url(auth_url)
+    branch_info = f" (branch: {effective_branch})" if effective_branch else ""
+    print(f"[repo] Cloning {safe_url}{branch_info} …")
+
+    try:
+        # Repo.clone_from() is GitPython's equivalent of `git clone`.
+        #
+        # depth=1  →  shallow clone (only the latest commit snapshot).
+        #             This is critical for speed — a repo with years of
+        #             history can be hundreds of MB but we only need the
+        #             current file contents, so depth=1 is always correct here.
+        #
+        # branch   →  if None, GitPython omits the flag and git uses the
+        #             remote's default branch (usually main or master).
+        #
+        # progress →  our custom _CloneProgress reporter (optional).
+
+        clone_kwargs = {
+            "depth": 1,
+            "progress": _CloneProgress() if show_progress else None,
+        }
+        if effective_branch:
+            clone_kwargs["branch"] = effective_branch
+
+        git.Repo.clone_from(auth_url, temp_dir, **clone_kwargs)
+
+    except git.exc.GitCommandError as exc:
+        # GitCommandError carries the full stderr from git in exc.stderr.
+        # We redact the URL from it before showing it to the user so that
+        # error messages never reveal the embedded token.
+        shutil.rmtree(temp_dir, ignore_errors=True)   # clean up empty dir
+        safe_stderr = _redact_url(str(exc.stderr or ""))
+        raise RuntimeError(
+            f"Clone failed for {safe_url}{branch_info}.\n"
+            f"Git said: {safe_stderr.strip()}"
+        ) from None   # 'from None' suppresses the original traceback chain
+                      # so the user sees our clean message, not GitPython internals
+
+    print(
+        f"[repo] Cloned '{parsed['owner']}/{parsed['repo']}' "
+        f"({parsed['provider']}) → {temp_dir}"
+    )
+    return temp_dir
+
+
+def cleanup_temp_repo(temp_dir: str, keep: bool = False):
+    """Delete the temporary clone directory.
+
+    When *keep* is True the directory is preserved and its path is printed.
+    This is useful for manually inspecting the cloned files if conversion
+    produces unexpected results.
+    """
+    if keep:
+        print(f"[repo] --keep-temp: clone preserved at {temp_dir}")
+    else:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        print("[repo] Temporary clone removed.")
+
+
+# ---------------------------------------------------------------------------
+# High-level remote → OpenAPI orchestrator
+# ---------------------------------------------------------------------------
+
+def generate_openapi_from_remote(
+    repo_url: str,
+    output_dir: str = None,
+    token: str = None,
+    branch: str = None,
+    bb_user: str = None,
+    keep_temp: bool = False,
+    include_packages=None,
+    exclude_packages=None,
+) -> tuple:
+    """Clone a remote repo and convert it to an OpenAPI spec.
+
+    This is the single function that ties together URL parsing, cloning,
+    Maven metadata extraction, Java analysis, and YAML output.  It is
+    designed so that callers (including the CLI __main__ block) only need
+    to call one function for the entire remote-repo workflow.
+
+    The try/finally structure is intentional and important.  Python's
+    finally block runs regardless of whether the try block completed
+    normally or raised an exception — even a KeyboardInterrupt.  This
+    guarantees that the temporary clone directory is always deleted
+    (unless --keep-temp was requested), so we never leave gigabytes of
+    cloned code in /tmp if something goes wrong mid-conversion.
+
+    Returns
+    -------
+    tuple : (spec_dict, output_yaml_path, temp_dir_path)
+    """
+    temp_dir = None
+    try:
+        temp_dir = clone_repo(
+            repo_url,
+            token=token,
+            branch=branch,
+            bb_user=bb_user,
+        )
+
+        pom = os.path.join(temp_dir, "pom.xml")
+        if not os.path.exists(pom):
+            raise RuntimeError(
+                f"No pom.xml found in the cloned repository root.\n"
+                "This tool supports Maven projects. "
+                "Make sure you're pointing at the project root, not a subdirectory."
+            )
+
+        meta = extract_maven_metadata(pom)
+
+        spec, controller_files, model_files = generate_openapi_from_project(
+            temp_dir,
+            include_packages=include_packages,
+            exclude_packages=exclude_packages,
+        )
+
+        spec["info"]["title"]   = meta.get("title",   spec["info"]["title"])
+        spec["info"]["version"] = meta.get("version", spec["info"]["version"])
+
+        # Record the source repo URL in the spec as an OpenAPI extension field.
+        # The 'x-' prefix is the standard OpenAPI convention for custom metadata
+        # fields — tools that don't understand it simply ignore it.
+        parsed = parse_repo_url(repo_url)
+        if parsed["provider"] == "github":
+            spec["info"]["x-source-repo"] = (
+                f"https://github.com/{parsed['owner']}/{parsed['repo']}"
+            )
+        else:
+            spec["info"]["x-source-repo"] = (
+                f"https://bitbucket.org/{parsed['owner']}/{parsed['repo']}"
+            )
+
+        yaml_output = yaml.dump(spec, sort_keys=False, default_flow_style=False)
+
+        # Write output to disk.  We cannot write inside temp_dir because
+        # it will be deleted by the finally block, so we use a separate
+        # output directory — defaulting to ./<repo-name>-openapi-spec/
+        # in the current working directory.
+        out_folder = output_dir or os.path.join(
+            os.getcwd(), f"{parsed['repo']}-openapi-spec"
+        )
+        os.makedirs(out_folder, exist_ok=True)
+        out_path = os.path.join(out_folder, "openapi.yaml")
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(yaml_output)
+
+        print(f"[repo] OpenAPI spec written to {out_path}")
+        print(
+            f"[repo] Processed {len(controller_files)} controller file(s), "
+            f"{len(model_files)} model/DTO file(s)"
+        )
+
+        return spec, out_path, temp_dir
+
+    finally:
+        # Always runs — success, error, or Ctrl-C
+        if temp_dir is not None:
+            cleanup_temp_repo(temp_dir, keep=keep_temp)
 
 
 # ---------------------------------------------------------------------------
@@ -855,56 +1332,183 @@ def generate_openapi_from_project(project_root: str,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Convert Spring Boot project controllers into an OpenAPI YAML file."
+        description=(
+            "Convert a Spring Boot project's controllers into an OpenAPI YAML spec.\n\n"
+            "Works with local project directories, GitHub repos, and Bitbucket repos."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples
+--------
+  # Local Maven project
+  python java_to_openapi.py /path/to/my-spring-app
+
+  # Public GitHub repo
+  python java_to_openapi.py --repo https://github.com/acme/my-service
+
+  # Public Bitbucket repo
+  python java_to_openapi.py --repo https://bitbucket.org/acme/my-service
+
+  # Private GitHub repo (token via flag or env var)
+  python java_to_openapi.py --repo https://github.com/acme/private --token ghp_xxx
+  GITHUB_TOKEN=ghp_xxx python java_to_openapi.py --repo https://github.com/acme/private
+
+  # Private Bitbucket repo (app password - needs username too)
+  python java_to_openapi.py --repo https://bitbucket.org/acme/private \\
+      --token ATBBxxx --bb-user myusername
+
+  # Private Bitbucket repo (repository access token - no username needed)
+  python java_to_openapi.py --repo https://bitbucket.org/acme/private --token TOKEN
+
+  # Specific branch, custom output directory, package filter
+  python java_to_openapi.py --repo https://github.com/acme/my-service \\
+      --branch develop --output-dir ./specs --include-packages com.acme.api
+
+  # Keep the temp clone for debugging
+  python java_to_openapi.py --repo https://github.com/acme/my-service --keep-temp
+        """,
     )
-    parser.add_argument('project_root', nargs='?',
-                        help='Root directory of the Spring Boot application')
-    parser.add_argument('--include-packages',
-                        help='Comma-separated list of package prefixes to include')
-    parser.add_argument('--exclude-packages',
-                        help='Comma-separated list of package prefixes to exclude')
-    parser.add_argument('--output-dir',
-                        help='Directory in which to write the OpenAPI spec')
+
+    # project_root (positional) and --repo are mutually exclusive:
+    # you either point at a local directory OR a remote URL, never both.
+    source_group = parser.add_mutually_exclusive_group()
+    source_group.add_argument(
+        "project_root",
+        nargs="?",
+        help="Root directory of a local Spring Boot Maven project (must contain pom.xml).",
+    )
+    source_group.add_argument(
+        "--repo",
+        metavar="URL",
+        help=(
+            "GitHub or Bitbucket repository URL to clone and convert. "
+            "Accepts HTTPS, HTTPS-with-branch, and SSH forms."
+        ),
+    )
+
+    # Remote-only options, grouped together in --help output
+    remote_group = parser.add_argument_group("Remote repository options")
+    remote_group.add_argument(
+        "--token",
+        metavar="TOKEN",
+        help=(
+            "Authentication token for private repositories. "
+            "For GitHub: a Personal Access Token (PAT). "
+            "For Bitbucket: an App Password or a Repository Access Token. "
+            "Falls back to GITHUB_TOKEN or BITBUCKET_TOKEN env vars."
+        ),
+    )
+    remote_group.add_argument(
+        "--bb-user",
+        metavar="USERNAME",
+        help=(
+            "Bitbucket username, required when using App Passwords. "
+            "Not needed for Repository Access Tokens. "
+            "Falls back to the BITBUCKET_USER env var."
+        ),
+    )
+    remote_group.add_argument(
+        "--branch",
+        metavar="BRANCH",
+        help=(
+            "Branch or tag to check out. Overrides any branch in the URL. "
+            "Defaults to the repository's default branch."
+        ),
+    )
+    remote_group.add_argument(
+        "--keep-temp",
+        action="store_true",
+        help="Do not delete the temporary clone directory after conversion (useful for debugging).",
+    )
+
+    # Options shared by both local and remote modes
+    parser.add_argument(
+        "--include-packages",
+        help="Comma-separated package prefixes to include (e.g. com.acme.api,com.acme.dto).",
+    )
+    parser.add_argument(
+        "--exclude-packages",
+        help="Comma-separated package prefixes to exclude.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help=(
+            "Where to write openapi.yaml. "
+            "Local default: <project_root>/openapi-spec/. "
+            "Remote default: ./<repo-name>-openapi-spec/ in current directory."
+        ),
+    )
 
     args = parser.parse_args()
 
+    include_pkgs = args.include_packages.split(",") if args.include_packages else None
+    exclude_pkgs = args.exclude_packages.split(",") if args.exclude_packages else None
+
+    # ------------------------------------------------------------------
+    # Remote mode  (--repo flag provided)
+    # ------------------------------------------------------------------
+    if args.repo:
+        try:
+            generate_openapi_from_remote(
+                repo_url=args.repo,
+                output_dir=args.output_dir,
+                token=args.token,
+                branch=args.branch,
+                bb_user=args.bb_user,
+                keep_temp=args.keep_temp,
+                include_packages=include_pkgs,
+                exclude_packages=exclude_pkgs,
+            )
+        except (ValueError, RuntimeError) as exc:
+            # ValueError  → bad URL format from parse_repo_url()
+            # RuntimeError → git not found, clone failed, no pom.xml
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+
+    # ------------------------------------------------------------------
+    # Local project mode  (original behaviour, fully preserved)
+    # ------------------------------------------------------------------
     root = args.project_root
     if not root:
         root = input("Enter Spring Boot project root path: ").strip()
     root = os.path.abspath(root)
+
     if not os.path.isdir(root):
-        print(f"Invalid project root: {root}")
+        print(f"Error: '{root}' is not a valid directory.", file=sys.stderr)
         sys.exit(1)
 
-    pom = os.path.join(root, 'pom.xml')
+    pom = os.path.join(root, "pom.xml")
     if not os.path.exists(pom):
-        print(f"No pom.xml found in {root}; please point at a Maven project")
+        print(
+            f"Error: No pom.xml found in {root}.\n"
+            "Please point at the root of a Maven project.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     meta = extract_maven_metadata(pom)
     spec, controller_files, model_files = generate_openapi_from_project(
         root,
-        include_packages=(
-            args.include_packages.split(',') if args.include_packages else None
-        ),
-        exclude_packages=(
-            args.exclude_packages.split(',') if args.exclude_packages else None
-        ),
+        include_packages=include_pkgs,
+        exclude_packages=exclude_pkgs,
     )
-    spec['info']['title'] = meta.get('title', spec['info']['title'])
-    spec['info']['version'] = meta.get('version', spec['info']['version'])
+    spec["info"]["title"]   = meta.get("title",   spec["info"]["title"])
+    spec["info"]["version"] = meta.get("version", spec["info"]["version"])
 
     yaml_output = yaml.dump(spec, sort_keys=False, default_flow_style=False)
     print(yaml_output)
 
-    out_folder = args.output_dir or os.path.join(root, 'openapi-spec')
+    out_folder = args.output_dir or os.path.join(root, "openapi-spec")
     os.makedirs(out_folder, exist_ok=True)
-    out_path = os.path.join(out_folder, 'openapi.yaml')
+    out_path = os.path.join(out_folder, "openapi.yaml")
     try:
-        with open(out_path, 'w', encoding='utf-8') as f:
+        with open(out_path, "w", encoding="utf-8") as f:
             f.write(yaml_output)
         print(f"OpenAPI spec written to {out_path}")
-        print(f"Processed {len(controller_files)} controller file(s), "
-              f"{len(model_files)} model/DTO file(s)")
-    except Exception as e:
-        print(f"Failed to write spec: {e}")
+        print(
+            f"Processed {len(controller_files)} controller file(s), "
+            f"{len(model_files)} model/DTO file(s)"
+        )
+    except Exception as exc:
+        print(f"Failed to write spec: {exc}", file=sys.stderr)
